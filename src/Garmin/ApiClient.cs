@@ -1,9 +1,10 @@
 ﻿using Common.Http;
 using Common.Observe;
-using Common.Stateful;
+using Common.Service;
 using Flurl.Http;
 using Garmin.Auth;
 using Garmin.Dto;
+using OAuth;
 using Serilog;
 using System.IO;
 using System.Linq;
@@ -13,44 +14,60 @@ namespace Garmin
 {
 	public interface IGarminApiClient
 	{
-		Task InitSigninFlowAsync(object queryParams, string userAgent, out CookieJar jar);
-		Task<SendCredentialsResult> SendCredentialsAsync(GarminApiAuthentication auth, object queryParams, object loginData, CookieJar jar);
-		Task<string> SendMfaCodeAsync(string userAgent, object queryParams, object mfaData, CookieJar jar);
-		Task<IFlurlResponse> SendServiceTicketAsync(string userAgent, string serviceTicket, CookieJar jar);
+		Task<CookieJar> InitCookieJarAsync(object queryParams);
+		Task<GarminResult> GetCsrfTokenAsync(object queryParams, CookieJar jar);
+		Task<SendCredentialsResult> SendCredentialsAsync(string email, string password, object queryParams, object loginData, CookieJar jar);
+		Task<string> SendMfaCodeAsync(object queryParams, object mfaData, CookieJar jar);
+		Task<string> GetOAuth1TokenAsync(ConsumerCredentials credentials, string ticket);
+		Task<OAuth2Token> GetOAuth2TokenAsync(OAuth1Token oAuth1Token, ConsumerCredentials credentials);
+		Task<ConsumerCredentials> GetConsumerCredentialsAsync();
 		Task<UploadResponse> UploadActivity(string filePath, string format, GarminApiAuthentication auth);
 	}
 
 	public class ApiClient : IGarminApiClient
 	{
-		private const string BASE_URL = "https://connect.garmin.com";
-		private const string SSO_URL = "https://sso.garmin.com";
-		private const string SIGNIN_URL = "https://sso.garmin.com/sso/signin";
-
-		private static string UPLOAD_URL = $"{BASE_URL}/modern/proxy/upload-service/upload";
-
-		private const string ORIGIN = SSO_URL;
+		private ISettingsService _settingsService;
 
 		private static readonly ILogger _logger = LogContext.ForClass<ApiClient>();
 
-		public Task InitSigninFlowAsync(object queryParams, string userAgent, out CookieJar jar)
+		public ApiClient(ISettingsService settingsService)
 		{
-			return SIGNIN_URL
-						.WithHeader("User-Agent", userAgent)
-						.WithHeader("origin", ORIGIN)
-						.SetQueryParams(queryParams)
-						.WithCookies(out jar)
-						.GetStringAsync();
+			_settingsService = settingsService;
 		}
 
-		public async Task<SendCredentialsResult> SendCredentialsAsync(GarminApiAuthentication auth, object queryParams, object loginData, CookieJar jar)
+		public Task<ConsumerCredentials> GetConsumerCredentialsAsync()
 		{
+			return "https://thegarth.s3.amazonaws.com/oauth_consumer.json"
+				.GetJsonAsync<ConsumerCredentials>();
+		}
+
+		public async Task<CookieJar> InitCookieJarAsync(object queryParams)
+		{
+			var setttings = await _settingsService.GetSettingsAsync();
+
+			await setttings.Garmin.Api.SsoEmbedUrl
+						.WithHeader("User-Agent", setttings.Garmin.Api.SsoUserAgent)
+						.WithHeader("origin", setttings.Garmin.Api.Origin)
+						.SetQueryParams(queryParams)
+						.WithCookies(out var jar)
+						.GetStringAsync();
+
+			return jar;
+		}
+
+		public async Task<SendCredentialsResult> SendCredentialsAsync(string email, string password, object queryParams, object loginData, CookieJar jar)
+		{
+			var setttings = await _settingsService.GetSettingsAsync();
+
 			var result = new SendCredentialsResult();
-			result.RawResponseBody = await SIGNIN_URL
-						.WithHeader("User-Agent", auth.UserAgent)
-						.WithHeader("origin", ORIGIN)
+			result.RawResponseBody = await setttings.Garmin.Api.SsoSignInUrl
+						.WithHeader("User-Agent", setttings.Garmin.Api.SsoUserAgent)
+						.WithHeader("origin", setttings.Garmin.Api.Origin)
+						.WithHeader("referer", setttings.Garmin.Api.Referer)
+						.WithHeader("NK", "NT")
 						.SetQueryParams(queryParams)
 						.WithCookies(jar)
-						.StripSensitiveDataFromLogging(auth.Email, auth.Password)
+						.StripSensitiveDataFromLogging(email, password)
 						.OnRedirect((r) => { result.WasRedirected = true; result.RedirectedTo = r.Redirect.Url; })
 						.PostUrlEncodedAsync(loginData)
 						.ReceiveString();
@@ -58,11 +75,29 @@ namespace Garmin
 			return result;
 		}
 
-		public Task<string> SendMfaCodeAsync(string userAgent, object queryParams, object mfaData, CookieJar jar)
+		public async Task<GarminResult> GetCsrfTokenAsync(object queryParams, CookieJar jar)
 		{
-			return "https://sso.garmin.com/sso/verifyMFA/loginEnterMfaCode"
-						.WithHeader("User-Agent", userAgent)
-						.WithHeader("origin", ORIGIN)
+			var setttings = await _settingsService.GetSettingsAsync();
+
+			var result = new GarminResult();
+			result.RawResponseBody = await setttings.Garmin.Api.SsoSignInUrl
+						.WithHeader("User-Agent", setttings.Garmin.Api.SsoUserAgent)
+						.WithHeader("origin", setttings.Garmin.Api.Origin)
+						.SetQueryParams(queryParams)
+						.WithCookies(jar)
+						.GetAsync()
+						.ReceiveString();
+
+			return result;
+		}
+
+		public async Task<string> SendMfaCodeAsync(object queryParams, object mfaData, CookieJar jar)
+		{
+			var setttings = await _settingsService.GetSettingsAsync();
+
+			return await setttings.Garmin.Api.SsoMfaCodeUrl
+						.WithHeader("User-Agent", setttings.Garmin.Api.SsoUserAgent)
+						.WithHeader("origin", setttings.Garmin.Api.Origin)
 						.SetQueryParams(queryParams)
 						.WithCookies(jar)
 						.OnRedirect(redir => redir.Request.WithCookies(jar))
@@ -70,23 +105,43 @@ namespace Garmin
 						.ReceiveString();
 		}
 
-		public Task<IFlurlResponse> SendServiceTicketAsync(string userAgent, string serviceTicket, CookieJar jar)
+		public async Task<string> GetOAuth1TokenAsync(ConsumerCredentials credentials, string ticket)
 		{
-			return $"{BASE_URL}/"
-						.WithHeader("User-Agent", userAgent)
-						.WithCookies(jar)
-						.SetQueryParam("ticket", serviceTicket)
-						.GetAsync();
+			var setttings = await _settingsService.GetSettingsAsync();
+
+			OAuthRequest oauthClient = OAuthRequest.ForRequestToken(credentials.Consumer_Key, credentials.Consumer_Secret);
+			oauthClient.RequestUrl = $"{setttings.Garmin.Api.OAuth1TokenUrl}?ticket={ticket}&login-url={setttings.Garmin.Api.OAuth1LoginUrlParam}";
+
+			return await oauthClient.RequestUrl
+							.WithHeader("User-Agent", setttings.Garmin.Api.SsoUserAgent)
+							.WithHeader("Authorization", oauthClient.GetAuthorizationHeader())
+							.GetStringAsync();
+		}
+		public async Task<OAuth2Token> GetOAuth2TokenAsync(OAuth1Token oAuth1Token, ConsumerCredentials credentials)
+		{
+			var setttings = await _settingsService.GetSettingsAsync();
+
+			OAuthRequest oauthClient2 = OAuthRequest.ForProtectedResource("POST", credentials.Consumer_Key, credentials.Consumer_Secret, oAuth1Token.Token, oAuth1Token.TokenSecret);
+			oauthClient2.RequestUrl = setttings.Garmin.Api.OAuth2RequestUrl;
+			
+			return await oauthClient2.RequestUrl
+								.WithHeader("User-Agent", setttings.Garmin.Api.SsoUserAgent)
+								.WithHeader("Authorization", oauthClient2.GetAuthorizationHeader())
+								.WithHeader("Content-Type", "application/x-www-form-urlencoded") // this header is required, without it you get a 500
+								.PostUrlEncodedAsync(new object()) // hack: PostAsync() will drop the content-type header, by posting empty object we trick flurl into leaving the header
+								.ReceiveJson<OAuth2Token>();
 		}
 
 		public async Task<UploadResponse> UploadActivity(string filePath, string format, GarminApiAuthentication auth)
 		{
+			var settings = await _settingsService.GetSettingsAsync();
+
 			var fileName = Path.GetFileName(filePath);
-			var response = await $"{UPLOAD_URL}/{format}"
-				.WithCookies(auth.CookieJar)
-				.WithHeader("NK", "NT")
-				.WithHeader("origin", ORIGIN)
-				.WithHeader("User-Agent", auth.UserAgent)
+			var response = await $"{settings.Garmin.Api.UploadActivityUrl}/{format}"
+				.WithOAuthBearerToken(auth.OAuth2Token.Access_Token)
+				.WithHeader("NK", settings.Garmin.Api.UplaodActivityNkHeader)
+				.WithHeader("origin", settings.Garmin.Api.Origin)
+				.WithHeader("User-Agent", settings.Garmin.Api.UploadActivityUserAgent)
 				.AllowHttpStatus("2xx,409")
 				.PostMultipartAsync((data) =>
 				{
@@ -119,263 +174,5 @@ namespace Garmin
 
 			return response;
 		}
-
-		//private const string URL_HOSTNAME = "https://connect.garmin.com/modern/auth/hostname";
-		//private const string URL_LOGIN = "https://sso.garmin.com/sso/login";
-		//private const string URL_POST_LOGIN = "https://connect.garmin.com/modern/";
-		//private const string URL_HOST_SSO = "sso.garmin.com";
-		//private const string URL_HOST_CONNECT = "connect.garmin.com";
-		//private const string URL_SSO_SIGNIN = "https://sso.garmin.com/sso/signin";
-		//private const string URL_ACTIVITY_BASE = "https://connect.garmin.com/modern/proxy/activity-service/activity";
-		//private const string URL_ACTIVITY_TYPES = "https://connect.garmin.com/modern/proxy/activity-service/activity/activityTypes";
-		/// <summary>
-		/// This is where the magic happens!
-		/// Straight from  https://github.com/La0/garmin-uploader
-		/// </summary>
-		//public async Task InitAuth2()
-		//{
-		//	dynamic ssoHostResponse = null;
-		//	try
-		//	{
-		//		ssoHostResponse = await URL_HOSTNAME
-		//						.WithHeader("User-Agent", USERAGENT)
-		//						.WithCookies(out _jar)
-		//						.GetJsonAsync<dynamic>();
-		//	}
-		//	catch (FlurlHttpException e)
-		//	{
-		//		Log.Error(e, "Failed to authenticate with Garmin. Invalid initial SO request.");
-		//		throw;
-		//	}
-
-		//	var ssoHostName = ssoHostResponse.host;
-
-		//	object queryParams = new
-		//	{
-		//		clientId = "GarminConnect",
-		//		//connectLegalTerms = "true",
-		//		consumeServiceTicket = "false",
-		//		createAccountShown = "true",
-		//		//cssUrl = "https://connect.garmin.com/gauth-custom-v1.2-min.css",
-		//		cssUrl = "https://static.garmincdn.com/com.garmin.connect/ui/css/gauth-custom-v1.2-min.css",
-		//		displayNameShown = "false",
-		//		embedWidget = "false",
-		//		gauthHost = "https://sso.garmin.com/sso",
-		//		//generateExtraServiceTicket = "true",
-		//		generateExtraServiceTicket = "false",
-		//		//generateNoServiceTicket = "false",
-		//		//generateTwoExtraServiceTickets = "true",
-		//		//globalOptInChecked = "false",
-		//		//globalOptInShown = "true",
-		//		id = "gauth-widget",
-		//		initialFocus = "true",
-		//		//locale = "fr_FR",
-		//		locale = "en_US",
-		//		//locationPromptShown = "true",
-		//		//mfaRequired = "false",
-		//		//performMFACheck = "false",
-		//		//mobile = "false",
-		//		openCreateAccount = "false",
-		//		//privacyStatementUrl = "https://www.garmin.com/fr-FR/privacy/connect/",
-		//		//redirectAfterAccountCreationUrl = "https://connect.garmin.com/modern/",
-		//		//redirectAfterAccountLoginUrl = "https://connect.garmin.com/modern/",
-		//		redirectAfterAccountCreationUrl = "https://connect.garmin.com/",
-		//		redirectAfterAccountLoginUrl = "https://connect.garmin.com/",
-		//		rememberMeChecked = "false",
-		//		rememberMeShown = "true",
-		//		//rememberMyBrowserChecked = "false",
-		//		//rememberMyBrowserShown = "false",
-		//		//service = "https://connect.garmin.com/modern/",
-		//		service = "https://connect.garmin.com",
-		//		//showConnectLegalAge = "false",
-		//		//showPassword = "true",
-		//		//showPrivacyPolicy = "false",
-		//		//showTermsOfUse = "false",
-		//		//source = "https://connect.garmin.com/signin/",
-		//		source = "https://connect.garmin.com",
-		//		//useCustomHeader = "false",
-		//		usernameShow = "false",
-		//		//webhost = ssoHostName.ToString()
-		//		//webhost = "https://connect.garmin.com/modern/"
-		//		webhost = "https://connect.garmin.com"
-		//	};
-
-		//	string loginForm = null;
-		//	try
-		//	{
-		//		loginForm = await URL_LOGIN
-		//					.WithHeader("User-Agent", USERAGENT)
-		//					.SetQueryParams(queryParams)
-		//					.WithCookies(_jar)
-		//					.GetStringAsync();
-
-		//	}
-		//	catch (FlurlHttpException e)
-		//	{
-		//		Log.Error(e, "No login form.");
-		//		throw;
-		//	}
-
-		//	// Lookup CSRF token
-		//	var regex = new Regex("<input type=\\\"hidden\\\" name=\\\"_csrf\\\" value=\\\"(\\w+)\\\" />");
-		//	var csrfTokenMatch = regex.Match(loginForm);
-
-		//	if (!csrfTokenMatch.Success)
-		//	{
-		//		Log.Error("No CSRF token.");
-		//		throw new Exception("Failed to find CSRF token from Garmin.");
-		//	}
-
-		//	var csrfToken = csrfTokenMatch.Groups[1].Value;
-
-		//	object loginData = new
-		//	{
-		//		embed = "false",
-		//		username = _config.Garmin.Email,
-		//		password = _config.Garmin.Password,
-		//		_csrf = csrfToken
-		//	};
-
-		//	string authResponse = null;
-
-		//	try
-		//	{
-		//		authResponse = await URL_LOGIN
-		//						.WithHeader("Host", URL_HOST_SSO)
-		//						.WithHeader("Referer", URL_SSO_SIGNIN)
-		//						.WithHeader("User-Agent", USERAGENT)
-		//						.SetQueryParams(queryParams)
-		//						.WithCookies(_jar)
-		//						.PostUrlEncodedAsync(loginData)
-		//						.ReceiveString();
-		//	}
-		//	catch (FlurlHttpException e)
-		//	{
-		//		Log.Error(e, "Authentication Failed.");
-		//		throw;
-		//	}
-
-		//	// Check we have SSO guid in the cookies
-		//	if (!_jar.Any(c => c.Name == "GARMIN-SSO-GUID"))
-		//	{
-		//		Log.Error("Missing Garmin auth cookie.");
-		//		throw new Exception("Failed to find Garmin auth cookie.");
-		//	}
-
-		//	// Try to find the full post login url in response
-		//	var regex2 = new Regex("var response_url(\\s+) = (\\\"|\\').*?ticket=(?<ticket>[\\w\\-]+)(\\\"|\\')");
-		//	var match = regex2.Match(authResponse);
-		//	if (!match.Success)
-		//	{
-		//		Log.Error("Missing service ticket.");
-		//		throw new Exception("Failed to find service ticket.");
-		//	}
-
-		//	var ticket = match.Groups.GetValueOrDefault("ticket").Value;
-		//	if (string.IsNullOrEmpty(ticket))
-		//	{
-		//		Log.Error("Failed to parse service ticket.");
-		//		throw new Exception("Failed to parse service ticket.");
-		//	}
-
-		//	queryParams = new
-		//	{
-		//		ticket = ticket
-		//	};
-
-		//	// Second Auth Step
-		//	// Needs a service ticket from the previous step
-		//	try
-		//	{
-		//		var authResponse2 = URL_POST_LOGIN
-		//					.WithHeader("User-Agent", USERAGENT)
-		//					.WithHeader("Host", URL_HOST_CONNECT)
-		//					.SetQueryParams(queryParams)
-		//					.WithCookies(_jar)
-		//					.GetStringAsync();
-		//	}
-		//	catch (FlurlHttpException e)
-		//	{
-		//		Log.Error(e, "Second auth step failed.");
-		//		throw;
-		//	}
-
-		//	// Check login
-		//	try
-		//	{
-		//		var response = PROFILE_URL
-		//					.WithHeader("User-Agent", USERAGENT)
-		//					.WithCookies(_jar)
-		//					.GetJsonAsync();
-		//	}
-		//	catch (FlurlHttpException e)
-		//	{
-		//		Log.Error(e, "Login check failed.");
-		//		throw;
-		//	}
-		//}
-
-		// TODO: I bet we can do multiple files at once
-		// https://github.com/tmenier/Flurl/issues/608
-
-		/// <summary>
-		/// Not quite working. Only uploads the first activity added.
-		/// </summary>
-		//public async Task<string> UploadActivities(ICollection<string> filePaths, string format)
-		//{
-		//	var auth = await InitAuth();
-
-		//	var response = await $"{UPLOAD_URL}/{format}"
-		//		.WithCookies(auth.CookieJar)
-		//		.WithHeader("NK", "NT")
-		//		.WithHeader("origin", ORIGIN)
-		//		.WithHeader("User-Agent", auth.UserAgent)
-		//		.AllowHttpStatus("2xx,409")
-		//		.PostMultipartAsync((data) =>
-		//		{
-		//			foreach (var path in filePaths)
-		//			{
-		//				var fileName = Path.GetFileName(path);
-		//				data.AddFile("\"file\"", path: path, contentType: "application/octet-stream", fileName: $"\"{fileName}\"");
-		//			}
-		//		})
-		//		.ReceiveJson<UploadResponse>();
-
-		//	var result = response.DetailedImportResult;
-
-		//	if (result.Failures.Any())
-		//	{
-		//		foreach (var failure in result.Failures)
-		//		{
-		//			if (failure.Messages.Any())
-		//			{
-		//				foreach (var message in failure.Messages)
-		//				{
-		//					if (message.Code == 202)
-		//					{
-		//						_logger.Information("Activity already uploaded {garminWorkout}", result.FileName);
-		//					}
-		//					else
-		//					{
-		//						_logger.Error("Failed to upload activity to Garmin. Message: {errorMessage}", message);
-		//					}
-		//				}
-		//			}
-		//		}
-		//	}
-
-		//	return string.Empty;
-		//}
-
-		//public async Task GetDeviceList()
-		//{
-		//	var auth = await InitAuth();
-
-		//	var response = await $"https://connect.garmin.com/proxy/device-service/deviceregistration/devices"
-		//		.WithCookies(auth.CookieJar)
-		//		.WithHeader("User-Agent", auth.UserAgent)
-		//		.WithHeader("origin", "https://sso.garmin.com")
-		//		.GetJsonAsync();
-		//}
 	}
 }
